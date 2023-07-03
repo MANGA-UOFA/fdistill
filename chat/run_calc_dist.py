@@ -13,21 +13,44 @@ import torch
 from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from utils import make_new_batch_data_lns, chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params, batchify, trunc_pred
-from metrics import calc_eval_metrics
-
+from utils import make_new_batch_data_lns, chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params, batchify
+from metrics import calc_nltk_nist, calc_eval_metrics_corpus, calc_eval_metrics
+from collections import defaultdict
 logger = getLogger(__name__)
 
 
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+def calc_diversity_list(hyps):
+    tokens = [0.0,0.0]
+    types = [defaultdict(int), defaultdict(int)]
+    for hyp in hyps:
+        words = hyp.split()#nltk.tokenize.word_tokenize(hyp)
+        for n in range(2):
+            for idx in range(len(words)-n):
+                ngram = ' '.join(words[idx:idx+n+1])
+                types[n][ngram] = 1
+                tokens[n] += 1
+    div1 = len(types[0].keys()) / max(tokens[0], 1)
+    div2 = len(types[1].keys())/ max(tokens[1], 1)
+    return div1, div2
+
+
+def trunc_pred(pred):
+    end_puncts = ['.', '!', '?']
+    if any([x in pred for x in end_puncts]):
+        pred = " ".join(pred.split())
+        last_end_idx = max([pred.rfind(x) for x in end_puncts])
+        return pred[:last_end_idx+1]
+    else:
+        return pred
 
 def eval_ppl_step(tokenizer, model, batch):
     pad_token_id = tokenizer.pad_token_id
 
     input_ids, input_mask, target_mask = batch["input_ids"], batch["attention_mask"], batch["target_mask"]
     student_outputs = model(input_ids, attention_mask=input_mask, use_cache=True)
-    lm_logits = student_outputs["logits"]
+    lm_logits = student_outputs["logits"]#[:, ctxt.size(1)-1:-1, :]
 
     # Same cross entropy vs. label smoothing logic as finetune.py
     ce_loss_fct = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id, reduction='none')
@@ -51,31 +74,35 @@ def generate_summaries_or_translations(
     prefix=None,
     max_src_length=512,
     beam_size=5,
-    top_p=0.9,
     temperature=1.,
-    min_length=3,
     **generate_kwargs,
 ):# -> Dict:
+    """Save model.generate results to <out_file>, and return how long it took."""
     fout = Path(out_file).open("w+", encoding="utf-8")
     model_name = str(model_name)
+    print('model name:   ', model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     if fp16:
         model = model.half()
     model.eval()
+    #model.temperature = 1.
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    logger.info(f"Inferred tokenizer type: {tokenizer.__class__}")  
+    logger.info(f"Inferred tokenizer type: {tokenizer.__class__}")  # if this is wrong, check config.model_type.
     tokenizer.padding_side = "left"
     ppl = 0.
     prefix = ""
     start_time = time.time()
     # update config with task specific params
     use_task_specific_params(model, task)
-    #if prefix is None:
         
     output_lns = []
     
     src_chunks = list(chunks(examples, batch_size))
+    examples_ref = [trunc_pred_2(x) for x in examples_ref]
     ref_chunks = list(chunks(examples_ref, batch_size))
+    d1_score = 0.
+    d2_score = 0.
+    N = 5
     for examples_chunk, examples_ref_chunk in tqdm(zip(src_chunks, ref_chunks), total=len(src_chunks)):
         examples_chunk = [prefix + text for text in examples_chunk]
         batch = make_new_batch_data_lns(examples_chunk, examples_ref_chunk, tokenizer)
@@ -85,32 +112,36 @@ def generate_summaries_or_translations(
         #tokenizer(examples_chunk, return_tensors="pt", truncation=True, padding="longest").to(device)
         slen = batch["input_ids"].size(1)
         summaries = model.generate(
-            batch["input_ids"].cuda(),
-            attention_mask=batch["attention_mask"].cuda(),
-            num_beams=beam_size,
+            batch["input_ids"].cuda().repeat_interleave(5, dim=0),
+            attention_mask=batch["attention_mask"].cuda().repeat_interleave(5, dim=0),
+            num_beams=1,#beam_size,
             do_sample=True,
-            top_p=top_p,
             temperature=temperature,
             pad_token_id=tokenizer.pad_token_id,
+            #bos_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             max_length=slen+64,
             length_penalty=1.,
-            min_length=slen+min_length,
+            min_length=batch["input_ids"].size(1)+3,
             **generate_kwargs,
         )
-        summaries = summaries[:, slen:]
+        summaries = summaries[:, batch["input_ids"].size(1):]
 
-        dec = tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        dec = tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        #print(dec)
+        #print(dec[0])
 
-        for hypothesis in dec:
-            hypothesis = trunc_pred(hypothesis.lstrip()).lstrip()
+        for i in range(0, len(dec), 5):
+            hypothesis = [trunc_pred(x.lstrip()).lstrip() for x in dec[i:i+N]]
+            d1, d2 = calc_diversity_list([" ".join(tokenizer.tokenize(x)) for x in hypothesis])
+            d1_score += d1
+            d2_score += d2
             output_lns.append(hypothesis)
-            fout.write(hypothesis + "\n")
+            fout.write(" ".join(hypothesis) + "\n")
             fout.flush()
+    print("dist-1 socre:\t", d1_score / len(examples))
+    print("dist-2 socre:\t", d2_score / len(examples))
     fout.close()
-    scores = {}
-    runtime = int(time.time() - start_time)  # seconds
-    n_obs = len(examples)
     return 
 
 def upper_first(str_):
@@ -156,10 +187,8 @@ def run_generate(verbose=True):
     parser.add_argument("--task", type=str, default="summarization", help="used for task_specific_params + metrics")
     parser.add_argument("--bs", type=int, default=8, required=False, help="batch size")
     parser.add_argument("--max_src_length", type=int, default=400, required=False)
-    parser.add_argument("--min_length", type=int, default=3, required=False)
     parser.add_argument("--num_beams", type=int, default=5, required=True)
     parser.add_argument("--temperature", type=float, default=1., required=True)
-    parser.add_argument("--top_p", type=float, default=0.9, required=False)
 
     parser.add_argument(
         "--n_obs", type=int, default=-1, required=False, help="How many observations. Defaults to all."
@@ -175,7 +204,7 @@ def run_generate(verbose=True):
         const=datetime_now(),
         help="use in conjunction w/ --dump-args to print with the results whatever other info you'd like, e.g. lang=en-ru. If no value is passed, the current datetime string will be used.",
     )
-
+    # Unspecified args like --num_beams=2 --decoder_start_token_id=4 are passed to model.generate
     args, rest = parser.parse_known_args()
     parsed_args = parse_numeric_n_bool_cl_kwargs(rest)
     if parsed_args and verbose:
@@ -188,6 +217,12 @@ def run_generate(verbose=True):
     if args.reference_path is None and Path(args.score_path).exists():
         warnings.warn(f"score_path {args.score_path} will be overwritten unless you type ctrl-c.")
 
+    EXCLUDE_IDS = []#[5, 24, 28, 31, 38, 41, 45, 64, 74, 75, 81, 94, 105, 107, 115, 119, 124, 135, 145, 146, 152, 158, 184, 190, 194, 197, 200, 202, 203, 223, 229, 237, 240, 248, 255, 258, 262, 267, 274, 277, 292, 298, 301, 303, 311, 312, 318, 323, 335, 348, 353, 376, 395, 404, 410, 413, 432, 443, 444, 452, 454, 458, 463, 478, 498, 500, 503, 504, 516, 530, 532, 538, 556, 557, 567, 568, 569, 572, 575, 578, 581, 584, 585, 589, 600, 606, 610, 614, 630, 635, 636, 639, 640, 645, 647, 651, 654, 659, 661, 671, 675, 681, 682, 683, 692, 694, 698, 699, 700, 704, 705, 706, 714, 715, 716, 722, 725, 727, 731, 734, 735, 743, 745, 747, 752, 754, 755, 756, 764, 765, 770, 777, 787, 798, 802, 807, 809, 812, 813, 816, 820, 821, 825, 828, 834, 836, 840, 841, 842, 845, 846, 849, 854, 857, 859, 863, 864, 870, 873, 875, 878, 882, 883, 891, 892, 893, 894, 895, 899, 903, 904, 908, 909, 912, 916, 917, 927, 931, 932, 933, 936, 940, 942, 948, 950, 951, 953, 954, 955, 959, 961, 962, 966, 967, 968, 974, 979, 982, 986, 995, 996, 997, 998, 999]
+
+    if args.use_all_source:
+        EXCLUDE_IDS = []
+
+    examples = [x for i, x in enumerate(examples) if not i+1 in EXCLUDE_IDS]
     
     torch.manual_seed(1024)
     scores = generate_summaries_or_translations(
@@ -203,12 +238,14 @@ def run_generate(verbose=True):
         max_src_length=args.max_src_length,
         beam_size=args.num_beams,
         temperature=args.temperature,
-        top_p=args.top_p,
-        min_length=args.min_length,
         **parsed_args,
     )
-    return 
+
+
+    return scores
 
 
 if __name__ == "__main__":
+    # Usage for MT:
+    # python run_eval.py MODEL_NAME $DATA_DIR/test.source $save_dir/test_translations.txt --reference_path $DATA_DIR/test.target --score_path $save_dir/test_bleu.json  --task translation $@
     run_generate(verbose=True)

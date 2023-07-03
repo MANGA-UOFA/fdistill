@@ -15,11 +15,26 @@ from tqdm import tqdm
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from utils import calculate_test_bleu, calculate_rouge, chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params
 
+from collections import defaultdict
 
 logger = getLogger(__name__)
 
 
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+def calc_diversity_list(hyps):
+    tokens = [0.0,0.0]
+    types = [defaultdict(int), defaultdict(int)]
+    for hyp in hyps:
+        words = hyp.split()#nltk.tokenize.word_tokenize(hyp)
+        for n in range(2):
+            for idx in range(len(words)-n):
+                ngram = ' '.join(words[idx:idx+n+1])
+                types[n][ngram] = 1
+                tokens[n] += 1
+    div1 = len(types[0].keys()) / max(tokens[0], 1)
+    div2 = len(types[1].keys())/ max(tokens[1], 1)
+    return div1, div2
 
 
 def generate_summaries_or_translations(
@@ -52,24 +67,37 @@ def generate_summaries_or_translations(
     use_task_specific_params(model, task)
     if prefix is None:
         prefix = prefix or getattr(model.config, "prefix", "") or ""
-
+    torch.manual_seed(42)
+    N = 5
+    d1_score = 0.
+    d2_score = 0.
     for examples_chunk in tqdm(list(chunks(examples, batch_size))):
+        #examples_chunk = [prefix + text for text in examples_chunk]
         examples_chunk = ["t" + text[1:] for text in examples_chunk]
         batch = tokenizer(examples_chunk, max_length=max_length, return_tensors="pt", truncation=True, padding="longest").to(device)
+        #print(len(tokenizer))
+        #print(batch.input_ids.size(), batch.input_ids.max(), batch.input_ids.min())
         summaries = model.generate(
             input_ids=batch.input_ids,
-            num_beams=num_beams,
             attention_mask=batch.attention_mask,
+            num_beams=5,
+            do_sample=True,
             **generate_kwargs,
         )
         dec = tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        for hypothesis in dec:
-            fout.write(hypothesis + "\n")
+        for i in range(0, len(dec), N):
+            hypothesis = [x.lstrip() for x in dec[i:i+N]]
+            d1, d2 = calc_diversity_list([" ".join(tokenizer.tokenize(x)) for x in hypothesis])
+            d1_score += d1
+            d2_score += d2
+            fout.write("\t".join(hypothesis) + "\n")
             fout.flush()
+    print("dist-1 socre:\t", d1_score / len(examples))
+    print("dist-2 socre:\t", d2_score / len(examples))
     fout.close()
     runtime = int(time.time() - start_time)  # seconds
     n_obs = len(examples)
-    return dict(n_obs=n_obs, runtime=runtime, seconds_per_sample=round(runtime / n_obs, 4))
+    return 
 
 
 def datetime_now():
@@ -147,22 +175,13 @@ def run_generate(verbose=True):
         **parsed_args,
     )
 
-    if args.reference_path is None:
-        return {}
-
     # Compute scores
     score_fn = calculate_test_bleu# if "translation" in args.task else calculate_rouge
     output_lns = [x.rstrip() for x in open(args.save_path).readlines()]
     reference_lns = [x.rstrip() for x in open(args.reference_path).readlines()][: len(output_lns)]
     scores = score_fn(output_lns, reference_lns)
-    #scores.update(runtime_metrics)
-    print(scores)
-    #if args.dump_args:
-    #    scores.update(parsed_args)
-    #if args.info:
-    #    scores["info"] = args.info
 
-    return
+    return 
 
 
 if __name__ == "__main__":
