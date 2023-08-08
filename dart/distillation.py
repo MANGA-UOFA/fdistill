@@ -189,6 +189,7 @@ class SummarizationDistiller(SummarizationModule):
                     self.e_matches,
                     normalize_hidden=self.hparams.normalize_hidden,
                 )
+        teacher_enc_outputs = all_teacher_encoder_outputs["last_hidden_state"]
 
         teacher_outputs = self.teacher(
             input_ids,
@@ -208,7 +209,6 @@ class SummarizationDistiller(SummarizationModule):
                 self.d_matches,
                 normalize_hidden=self.hparams.normalize_hidden,
             )
-
         blended_loss = (
             self.alpha_ce * loss_ce
             + self.alpha_mlm * student_lm_loss
