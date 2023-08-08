@@ -106,10 +106,7 @@ def generate_summaries_or_translations(
             loss_seq += (_loss.sum(1)/tgt_ids.ne(tokenizer.pad_token_id).float().sum(1)).cpu().tolist()
             loss += ce_loss_fct_2(logits.view(-1, logits.shape[-1]), tgt_ids.view(-1))
 
-    print("Lens:\t", lens/len(examples))
-    print('Tok-Level LOSS:\t', tok_loss / len(examples))
     print('LOSS:\t', np.mean(loss_seq))
-    print("Top-1 hit acc:\t", top1_hit/len(examples))
     runtime = int(time.time() - start_time)  # seconds
     n_obs = len(examples)
     return dict(n_obs=n_obs, runtime=runtime, seconds_per_sample=round(runtime / n_obs, 4))

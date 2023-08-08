@@ -13,31 +13,58 @@ import torch
 from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from utils import make_new_batch_data_lns, chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params, batchify, trunc_pred
-from metrics import calc_eval_metrics
-
+from utils import make_new_batch_data_lns, chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params, batchify
+from metrics import calc_nltk_nist, calc_eval_metrics_corpus, calc_eval_metrics
+import torch.nn.functional as F
 logger = getLogger(__name__)
-
+import numpy as np
 
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+def trunc_pred_2(pred):
+    end_puncts = ['.', '!', '?']
+    #if pred.startswith("."):
+    #    pred = pred[1:]
+    #print(pred)
+    if pred[0] in end_puncts:
+        pred = pred[1:]
+    if any([x in pred for x in end_puncts]):
+        pred = " ".join(pred.split())
+        last_end_idx = max([pred.rfind(x) for x in end_puncts])
+        pred = pred[:last_end_idx+1]
+    punct_c = 0
+    for i, x in enumerate(pred):
+        if x in end_puncts:
+            punct_c += 1
+        if punct_c == 2:
+            return pred[:i+1]
+    return pred#".".join(pred.split(".")[:4])+"."
+
+def trunc_pred(pred):
+    end_puncts = ['.', '!', '?']
+    if any([x in pred for x in end_puncts]):
+        pred = " ".join(pred.split())
+        last_end_idx = max([pred.rfind(x) for x in end_puncts])
+        return pred[:last_end_idx+1]
+    else:
+        return pred
 
 def eval_ppl_step(tokenizer, model, batch):
     pad_token_id = tokenizer.pad_token_id
 
     input_ids, input_mask, target_mask = batch["input_ids"], batch["attention_mask"], batch["target_mask"]
     student_outputs = model(input_ids, attention_mask=input_mask, use_cache=True)
-    lm_logits = student_outputs["logits"]
+    lm_logits = student_outputs["logits"]#[:, ctxt.size(1)-1:-1, :]
 
     # Same cross entropy vs. label smoothing logic as finetune.py
     ce_loss_fct = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id, reduction='none')
     #print(lm_logits.size(), response.size())            
     input_ids, lm_logits = input_ids[:, 1:], lm_logits[:, :-1]
     target_mask = target_mask[:, 1:].bool()
-
     loss = ce_loss_fct(lm_logits.contiguous().view(-1, lm_logits.shape[-1]), input_ids.contiguous().view(-1))
-    loss = torch.masked_select(loss, target_mask.contiguous().view(-1))
-    return loss.mean()
+    loss = (loss.view(target_mask.size(0), -1)*target_mask).sum(1) / target_mask.sum(1) #torch.masked_select(loss, target_mask.contiguous().view(-1))
+    entropy =  ((F.softmax(lm_logits, dim=-1) * F.log_softmax(lm_logits, dim=-1)).sum(dim=-1) * target_mask).sum(dim=1) / target_mask.float().sum(1)
+    return loss.mean(), entropy.cpu().tolist()
 
 def generate_summaries_or_translations(
     examples: List[str],
@@ -51,20 +78,19 @@ def generate_summaries_or_translations(
     prefix=None,
     max_src_length=512,
     beam_size=5,
-    top_p=0.9,
-    temperature=1.,
-    min_length=3,
     **generate_kwargs,
 ):# -> Dict:
-    fout = Path(out_file).open("w+", encoding="utf-8")
+    """Save model.generate results to <out_file>, and return how long it took."""
+
     model_name = str(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    print('model name:   ', model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name).to(device).eval()
     if fp16:
         model = model.half()
-    model.eval()
+    #model.temperature = 1.
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    logger.info(f"Inferred tokenizer type: {tokenizer.__class__}")  
-    tokenizer.padding_side = "left"
+    logger.info(f"Inferred tokenizer type: {tokenizer.__class__}")  # if this is wrong, check config.model_type.
+    #tokenizer.padding_side = "left"
     ppl = 0.
     prefix = ""
     start_time = time.time()
@@ -73,45 +99,19 @@ def generate_summaries_or_translations(
     #if prefix is None:
         
     output_lns = []
-    
+    entropy_ = []
     src_chunks = list(chunks(examples, batch_size))
+    #examples_ref = [trunc_pred_2(x) for x in examples_ref]
     ref_chunks = list(chunks(examples_ref, batch_size))
     for examples_chunk, examples_ref_chunk in tqdm(zip(src_chunks, ref_chunks), total=len(src_chunks)):
         examples_chunk = [prefix + text for text in examples_chunk]
         batch = make_new_batch_data_lns(examples_chunk, examples_ref_chunk, tokenizer)
         with torch.no_grad():
-            ppl += eval_ppl_step(tokenizer, model, batch)
-        batch = batchify(examples_chunk, tokenizer, 512)
-        #tokenizer(examples_chunk, return_tensors="pt", truncation=True, padding="longest").to(device)
-        slen = batch["input_ids"].size(1)
-        summaries = model.generate(
-            batch["input_ids"].cuda(),
-            attention_mask=batch["attention_mask"].cuda(),
-            num_beams=beam_size,
-            do_sample=True,
-            top_p=top_p,
-            temperature=temperature,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            max_length=slen+64,
-            length_penalty=1.,
-            min_length=slen+min_length,
-            **generate_kwargs,
-        )
-        summaries = summaries[:, slen:]
-
-        dec = tokenizer.batch_decode(summaries, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-
-        for hypothesis in dec:
-            hypothesis = trunc_pred(hypothesis.lstrip()).lstrip()
-            output_lns.append(hypothesis)
-            fout.write(hypothesis + "\n")
-            fout.flush()
-    fout.close()
-    scores = {}
-    runtime = int(time.time() - start_time)  # seconds
-    n_obs = len(examples)
-    return 
+            tmp = eval_ppl_step(tokenizer, model, batch)
+            ppl += tmp[0]
+            entropy_ += tmp[1]
+    print('ppl', ppl.cpu().item() / len(examples))
+    return ppl
 
 def upper_first(str_):
     if len(str_) > 1:
@@ -156,10 +156,7 @@ def run_generate(verbose=True):
     parser.add_argument("--task", type=str, default="summarization", help="used for task_specific_params + metrics")
     parser.add_argument("--bs", type=int, default=8, required=False, help="batch size")
     parser.add_argument("--max_src_length", type=int, default=400, required=False)
-    parser.add_argument("--min_length", type=int, default=3, required=False)
     parser.add_argument("--num_beams", type=int, default=5, required=True)
-    parser.add_argument("--temperature", type=float, default=1., required=True)
-    parser.add_argument("--top_p", type=float, default=0.9, required=False)
 
     parser.add_argument(
         "--n_obs", type=int, default=-1, required=False, help="How many observations. Defaults to all."
@@ -175,19 +172,25 @@ def run_generate(verbose=True):
         const=datetime_now(),
         help="use in conjunction w/ --dump-args to print with the results whatever other info you'd like, e.g. lang=en-ru. If no value is passed, the current datetime string will be used.",
     )
-
+    # Unspecified args like --num_beams=2 --decoder_start_token_id=4 are passed to model.generate
     args, rest = parser.parse_known_args()
     parsed_args = parse_numeric_n_bool_cl_kwargs(rest)
     if parsed_args and verbose:
         print(f"parsed the following generate kwargs: {parsed_args}")
     examples = [" " + x.rstrip() if "t5" in args.model_name else x.rstrip() for x in open(args.input_path).readlines()]
+    print("Reference:\t", args.reference_path)
     reference_lns = [x.rstrip() for x in open(args.reference_path).readlines()]
     if args.n_obs > 0:
         examples = examples[: args.n_obs]
-    Path(args.save_path).parent.mkdir(exist_ok=True)
     if args.reference_path is None and Path(args.score_path).exists():
         warnings.warn(f"score_path {args.score_path} will be overwritten unless you type ctrl-c.")
 
+    EXCLUDE_IDS = []
+
+    if args.use_all_source:
+        EXCLUDE_IDS = []
+
+    examples = [x for i, x in enumerate(examples) if not i+1 in EXCLUDE_IDS]
     
     torch.manual_seed(1024)
     scores = generate_summaries_or_translations(
@@ -202,13 +205,14 @@ def run_generate(verbose=True):
         prefix=args.prefix,
         max_src_length=args.max_src_length,
         beam_size=args.num_beams,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        min_length=args.min_length,
         **parsed_args,
     )
+
+    print(scores)
     return 
 
 
 if __name__ == "__main__":
+    # Usage for MT:
+    # python run_eval.py MODEL_NAME $DATA_DIR/test.source $save_dir/test_translations.txt --reference_path $DATA_DIR/test.target --score_path $save_dir/test_bleu.json  --task translation $@
     run_generate(verbose=True)

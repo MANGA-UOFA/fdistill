@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from transformers.models.bart.modeling_bart import shift_tokens_right
-from utils import read_webnlg_files, calculate_bleu, calculate_rouge, chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params
+from utils import chunks, parse_numeric_n_bool_cl_kwargs, use_task_specific_params
 
 
 logger = getLogger(__name__)
@@ -56,7 +56,6 @@ def generate_summaries_or_translations(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print(f"Inferred tokenizer type: {tokenizer.__class__}")  # if this is wrong, check config.model_type.
-    #print(model.model.encoder.embed_tokens.weight.size())
     start_time = time.time()
     # update config with task specific params
     use_task_specific_params(model, task)
@@ -101,13 +100,11 @@ def generate_summaries_or_translations(
         all_batch_loss = _loss.sum(0)
         tok_loss[:all_batch_loss.size(-1)] = tok_loss[:all_batch_loss.size(-1)] + all_batch_loss
         loss_seq += (_loss.sum(1)/tgt_ids.ne(tokenizer.pad_token_id).float().sum(1)).cpu().tolist()
-        
-    print('Tok-Level LOSS:\t', tok_loss / len(examples))
+    
     print('LOSS:\t', np.mean(loss_seq))
-    print("Top-1 hit acc:\t", top1_hit/len(examples))
     runtime = int(time.time() - start_time)  # seconds
     n_obs = len(examples)
-    return dict(n_obs=n_obs, runtime=runtime, seconds_per_sample=round(runtime / n_obs, 4))
+    return #dict(n_obs=n_obs, runtime=runtime, seconds_per_sample=round(runtime / n_obs, 4))
 
 
 def datetime_now():
@@ -169,6 +166,7 @@ def run_generate(verbose=True):
     Path(args.save_path).parent.mkdir(exist_ok=True)
     if args.reference_path is None and Path(args.score_path).exists():
         warnings.warn(f"score_path {args.score_path} will be overwritten unless you type ctrl-c.")
+    
     runtime_metrics = generate_summaries_or_translations(
         examples,
         references,
@@ -184,7 +182,7 @@ def run_generate(verbose=True):
         **parsed_args,
     )
 
-    return scores
+    return runtime_metrics
 
 
 if __name__ == "__main__":

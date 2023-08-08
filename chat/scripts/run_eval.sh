@@ -12,7 +12,7 @@ CUDA_LAUNCH_BLOCKING=1 python3 /home/fdill/chat/run_eval.py \
   --save_path $SLURM_TMPDIR/model.out \
   --reference_path /home/fdill/chat/Commonsense-Dialogues/test.target\
   --score_path $SLURM_TMPDIR/metrics.json \
-  --device cuda --num_beams $BEAM --temperature $TEMP --min_length $MIN_LEN --do_trunc_pred\
+  --device cuda --num_beams $BEAM --temperature $TEMP --min_length $MIN_LEN\
   "$@"
 
 cp $SLURM_TMPDIR/model.out $MODEL_NAME"model_out_b${BEAM}_T${TEMP}_ML${MIN_LEN}.test"

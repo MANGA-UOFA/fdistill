@@ -85,22 +85,25 @@ class Seq2SeqLoggingCallback(pl.Callback):
 
 def get_checkpoint_callback(output_dir, metric, save_top_k=1, lower_is_better=False, disable_monitor=False):
     """Saves the best model by validation ROUGE2 score."""
-    if metric == "BLEU":
-        exp = "{val_BLEU:.6f}-{step_count}"
-    elif metric == "NIST":
-        exp = "{val_NIST:.6f}-{step_count}"
-    elif metric == "neg_llh":
-        exp = "{val_NIST:.6f}-{step_count}"
-    elif metric == "Entropy":
-        exp = "{val_entropy:.4f}-{step_count}"
-    elif metric == "Diversity-1":
-        exp = "{val_div1:.4f}-{step_count}"
-    elif metric == "Diversity-2":
-        exp = "{val_div2:.4f}-{step_count}"
+    if disable_monitor: # alwasy save the last one.
+        exp = "step-{step_count}"
     else:
-        raise NotImplementedError(
-            f"seq2seq callbacks does not support {metric}, You can make your own by adding to this function."
-        )
+        if metric == "BLEU":
+            exp = "{val_BLEU:.6f}-{step_count}"
+        elif metric == "NIST":
+            exp = "{val_NIST:.6f}-{step_count}"
+        elif metric == "neg_llh":
+            exp = "{val_NIST:.6f}-{step_count}"
+        elif metric == "Entropy":
+            exp = "{val_entropy:.4f}-{step_count}"
+        elif metric == "Diversity-1":
+            exp = "{val_div1:.4f}-{step_count}"
+        elif metric == "Diversity-2":
+            exp = "{val_div2:.4f}-{step_count}"
+        else:
+            raise NotImplementedError(
+                f"seq2seq callbacks does not support {metric}, You can make your own by adding to this function."
+            )
     if disable_monitor:
         checkpoint_callback = ModelCheckpoint(
             dirpath=output_dir,
