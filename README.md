@@ -1,5 +1,6 @@
 # Pipelines for Training and Evaluation
 
+[Link to paper](fdistill-paper.pdf)
 
 ## Data-to-text (DART)
 
